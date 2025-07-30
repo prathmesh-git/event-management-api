@@ -1,4 +1,5 @@
-const pool = require("../models/db");
+const { sequelize, User, Event, Registration } = require("../models");
+const { Op } = require("sequelize");
 
 // POST /events
 exports.createEvent = async (req, res) => {
@@ -15,16 +16,11 @@ exports.createEvent = async (req, res) => {
         .json({ error: "Capacity must be between 1 and 1000" });
     }
 
-    const result = await pool.query(
-      `INSERT INTO events (title, date_time, location, capacity)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id`,
-      [title, date_time, location, capacity]
-    );
+    const event = await Event.create({ title, date_time, location, capacity });
 
     res.status(201).json({
       message: "Event created successfully",
-      event_id: result.rows[0].id,
+      event_id: event.id,
     });
   } catch (error) {
     console.error("Error creating event:", error.message);
@@ -37,27 +33,25 @@ exports.getEventDetails = async (req, res) => {
   const eventId = req.params.id;
 
   try {
-    const eventResult = await pool.query(`SELECT * FROM events WHERE id = $1`, [
-      eventId,
-    ]);
+    const event = await Event.findByPk(eventId, {
+      include: {
+        model: User,
+        attributes: ["id", "name", "email"],
+        through: { attributes: [] },
+      },
+    });
 
-    if (eventResult.rows.length === 0) {
+    if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
 
-    const event = eventResult.rows[0];
-
-    const userResult = await pool.query(
-      `SELECT u.id, u.name, u.email
-       FROM users u
-       INNER JOIN registrations r ON u.id = r.user_id
-       WHERE r.event_id = $1`,
-      [eventId]
-    );
-
     res.json({
-      ...event,
-      registered_users: userResult.rows,
+      id: event.id,
+      title: event.title,
+      date_time: event.date_time,
+      location: event.location,
+      capacity: event.capacity,
+      registered_users: event.Users,
     });
   } catch (error) {
     console.error("Error fetching event details:", error.message);
@@ -65,6 +59,7 @@ exports.getEventDetails = async (req, res) => {
   }
 };
 
+// POST /events/:id/register
 exports.registerForEvent = async (req, res) => {
   const eventId = req.params.id;
   const { name, email } = req.body;
@@ -73,71 +68,62 @@ exports.registerForEvent = async (req, res) => {
     return res.status(400).json({ error: "Name and email are required" });
   }
 
-  try {
-    // 1. Check if event exists and is in the future
-    const eventResult = await pool.query(`SELECT * FROM events WHERE id = $1`, [
-      eventId,
-    ]);
+  const t = await sequelize.transaction();
 
-    if (eventResult.rows.length === 0) {
+  try {
+    const event = await Event.findOne({
+      where: { id: eventId },
+      lock: t.LOCK.UPDATE,
+      transaction: t,
+    });
+
+    if (!event) {
+      await t.rollback();
       return res.status(404).json({ error: "Event not found" });
     }
 
-    const event = eventResult.rows[0];
-    const now = new Date();
-    const eventTime = new Date(event.date_time);
-
-    if (eventTime < now) {
+    if (new Date(event.date_time) < new Date()) {
+      await t.rollback();
       return res.status(403).json({ error: "Cannot register for past event" });
     }
 
-    // 2. Get or create user
-    let userResult = await pool.query(`SELECT * FROM users WHERE email = $1`, [
-      email,
-    ]);
+    const [user] = await User.findOrCreate({
+      where: { email },
+      defaults: { name },
+      transaction: t,
+    });
 
-    let userId;
-    if (userResult.rows.length === 0) {
-      const insertUser = await pool.query(
-        `INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id`,
-        [name, email]
-      );
-      userId = insertUser.rows[0].id;
-    } else {
-      userId = userResult.rows[0].id;
-    }
+    const alreadyRegistered = await Registration.findOne({
+      where: { userId: user.id, eventId: event.id },
+      transaction: t,
+    });
 
-    // 3. Check for duplicate registration
-    const regCheck = await pool.query(
-      `SELECT * FROM registrations WHERE user_id = $1 AND event_id = $2`,
-      [userId, eventId]
-    );
-
-    if (regCheck.rows.length > 0) {
+    if (alreadyRegistered) {
+      await t.rollback();
       return res
         .status(409)
         .json({ error: "User already registered for this event" });
     }
 
-    // 4. Check if event is full
-    const regCount = await pool.query(
-      `SELECT COUNT(*) FROM registrations WHERE event_id = $1`,
-      [eventId]
-    );
+    const currentCount = await Registration.count({
+      where: { eventId: event.id },
+      transaction: t,
+    });
 
-    const totalRegistered = parseInt(regCount.rows[0].count);
-    if (totalRegistered >= event.capacity) {
+    if (currentCount >= event.capacity) {
+      await t.rollback();
       return res.status(403).json({ error: "Event is full" });
     }
 
-    // 5. Register user
-    await pool.query(
-      `INSERT INTO registrations (user_id, event_id) VALUES ($1, $2)`,
-      [userId, eventId]
+    await Registration.create(
+      { userId: user.id, eventId: event.id },
+      { transaction: t }
     );
+    await t.commit();
 
     res.status(200).json({ message: "User registered successfully" });
   } catch (error) {
+    await t.rollback();
     console.error("Registration error:", error.message);
     res.status(500).json({ error: "Internal server error" });
   }
@@ -147,24 +133,15 @@ exports.cancelRegistration = async (req, res) => {
   const { eventId, userId } = req.params;
 
   try {
-    // Check if registration exists
-    const check = await pool.query(
-      `SELECT * FROM registrations WHERE event_id = $1 AND user_id = $2`,
-      [eventId, userId]
-    );
+    const reg = await Registration.findOne({ where: { eventId, userId } });
 
-    if (check.rows.length === 0) {
+    if (!reg) {
       return res
         .status(404)
         .json({ error: "User is not registered for this event" });
     }
 
-    // Delete the registration
-    await pool.query(
-      `DELETE FROM registrations WHERE event_id = $1 AND user_id = $2`,
-      [eventId, userId]
-    );
-
+    await reg.destroy();
     res.json({ message: "Registration cancelled successfully" });
   } catch (error) {
     console.error("Cancel registration error:", error.message);
@@ -175,15 +152,19 @@ exports.cancelRegistration = async (req, res) => {
 exports.listUpcomingEvents = async (req, res) => {
   try {
     const now = new Date();
+    const events = await Event.findAll({
+      where: {
+        date_time: {
+          [Op.gt]: now,
+        },
+      },
+      order: [
+        ["date_time", "ASC"],
+        ["location", "ASC"],
+      ],
+    });
 
-    const result = await pool.query(
-      `SELECT * FROM events
-       WHERE date_time > $1
-       ORDER BY date_time ASC, location ASC`,
-      [now]
-    );
-
-    res.json({ upcoming_events: result.rows });
+    res.json({ upcoming_events: events });
   } catch (error) {
     console.error("Error listing upcoming events:", error.message);
     res.status(500).json({ error: "Internal server error" });
@@ -194,27 +175,15 @@ exports.getEventStats = async (req, res) => {
   const eventId = req.params.id;
 
   try {
-    // 1. Get event capacity
-    const eventResult = await pool.query(
-      `SELECT capacity FROM events WHERE id = $1`,
-      [eventId]
-    );
+    const event = await Event.findByPk(eventId);
 
-    if (eventResult.rows.length === 0) {
+    if (!event) {
       return res.status(404).json({ error: "Event not found" });
     }
 
-    const capacity = eventResult.rows[0].capacity;
-
-    // 2. Count registrations
-    const regResult = await pool.query(
-      `SELECT COUNT(*) FROM registrations WHERE event_id = $1`,
-      [eventId]
-    );
-
-    const totalRegistrations = parseInt(regResult.rows[0].count);
-    const remainingCapacity = capacity - totalRegistrations;
-    const percentFull = Math.round((totalRegistrations / capacity) * 100);
+    const totalRegistrations = await Registration.count({ where: { eventId } });
+    const remainingCapacity = event.capacity - totalRegistrations;
+    const percentFull = Math.round((totalRegistrations / event.capacity) * 100);
 
     res.json({
       total_registrations: totalRegistrations,

@@ -9,12 +9,22 @@ const {
   getEventStats,
 } = require("../controllers/eventController");
 
-// Create Event
+// Create a new event
 router.post("/", createEvent);
-router.get("/:id", getEventDetails);
-router.post("/:id/register", registerForEvent);
-router.delete("/:eventId/register/:userId", cancelRegistration);
+
+// Upcoming events (should come before /:id or it’ll be treated as a param)
 router.get("/upcoming/list", listUpcomingEvents);
+
+// Register for event
+router.post("/:id/register", registerForEvent);
+
+// Cancel registration
+router.delete("/:eventId/register/:userId", cancelRegistration);
+
+// Get event statistics
 router.get("/:id/stats", getEventStats);
+
+// Get event details
+router.get("/:id", getEventDetails);
 
 module.exports = router;
